@@ -16,3 +16,6 @@ Cada código de 6 caracteres é roteado para um único Durable Object, garantind
 ## Por que isso existe
 
 O relay antigo da Vercel mantinha as salas em um `Map` em memória. Em produção, publisher e viewer podem cair em instâncias diferentes da Function e não se enxergarem. Durable Objects roteiam todos os participantes de uma sala para o mesmo objeto.
+
+## v1.0.1
+Corrige a versão de `@cloudflare/workers-types` para uma versão publicada no npm (`5.20260904.1`).

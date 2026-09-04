@@ -5,15 +5,37 @@ interface Env {
 }
 
 type Role = 'publisher' | 'viewer';
-type Attachment = { role: Role; waitingForKeyframe: boolean };
+type ViewerTransport = 'binary' | 'text';
+type Attachment = {
+  role: Role;
+  waitingForKeyframe: boolean;
+  transport: ViewerTransport;
+};
 type ControlMessage = { type?: string; sentAt?: number };
 
 const ROOM_RE = /^[A-Z2-9]{6}$/;
 const MAGIC = [65, 75, 86, 52]; // AKV4
+const TEXT_MEDIA_PREFIX = '@media:';
 
 function json(ws: WebSocket, value: unknown) {
   if (ws.readyState !== WebSocket.OPEN) return;
   try { ws.send(JSON.stringify(value)); } catch { }
+}
+
+function toBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  const native = (bytes as Uint8Array & { toBase64?: () => string }).toBase64;
+  if (typeof native === 'function') {
+    try { return native.call(bytes); } catch { }
+  }
+
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, Math.min(bytes.length, i + chunkSize));
+    binary += String.fromCharCode(...chunk);
+  }
+  return btoa(binary);
 }
 
 export class RoomRelay extends DurableObject<Env> {
@@ -24,6 +46,7 @@ export class RoomRelay extends DurableObject<Env> {
       return new Response('role inválido', { status: 400 });
     }
 
+    const transport: ViewerTransport = url.searchParams.get('transport') === 'text' ? 'text' : 'binary';
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
 
@@ -35,9 +58,13 @@ export class RoomRelay extends DurableObject<Env> {
     }
 
     this.ctx.acceptWebSocket(server, [role]);
-    server.serializeAttachment({ role, waitingForKeyframe: role === 'viewer' } satisfies Attachment);
+    server.serializeAttachment({
+      role,
+      waitingForKeyframe: role === 'viewer',
+      transport
+    } satisfies Attachment);
 
-    json(server, { type: 'hello', role, protocol: 4 });
+    json(server, { type: 'hello', role, protocol: 4, transport });
     await this.publishRoomState();
 
     return new Response(null, { status: 101, webSocket: client });
@@ -70,25 +97,44 @@ export class RoomRelay extends DurableObject<Env> {
     }
 
     if (attachment.role !== 'publisher') return;
+
     const bytes = new Uint8Array(message);
     if (bytes.byteLength < 24) return;
     for (let i = 0; i < MAGIC.length; i++) if (bytes[i] !== MAGIC[i]) return;
 
     const kind = bytes[5];
     const isKeyframe = (bytes[6] & 1) !== 0;
+    const viewers = this.ctx.getWebSockets('viewer').filter(v => v.readyState === WebSocket.OPEN);
+    if (viewers.length === 0) return;
 
-    for (const viewer of this.ctx.getWebSockets('viewer')) {
-      if (viewer.readyState !== WebSocket.OPEN) continue;
-      const state = (viewer.deserializeAttachment() ?? { role: 'viewer', waitingForKeyframe: true }) as Attachment;
+    // O proxy do Discord é confiável para WebSocket de texto, mas em alguns clientes
+    // os quadros binários grandes não chegam de forma consistente. Para esses viewers
+    // usamos um envelope base64. A conversão é feita uma vez e reutilizada para todos.
+    let textEnvelope: string | null = null;
+    const textViewerExists = viewers.some(v => {
+      const state = (v.deserializeAttachment() ?? {}) as Partial<Attachment>;
+      return state.transport === 'text';
+    });
+    if (textViewerExists) textEnvelope = TEXT_MEDIA_PREFIX + toBase64(message);
+
+    for (const viewer of viewers) {
+      const state = (viewer.deserializeAttachment() ?? {
+        role: 'viewer',
+        waitingForKeyframe: true,
+        transport: 'text'
+      }) as Attachment;
 
       if (kind === 1 && state.waitingForKeyframe && !isKeyframe) continue;
-      if (kind === 1 && isKeyframe && state.waitingForKeyframe) {
-        state.waitingForKeyframe = false;
-        viewer.serializeAttachment(state);
-      }
 
-      try { viewer.send(message); }
-      catch {
+      try {
+        if (state.transport === 'text') viewer.send(textEnvelope!);
+        else viewer.send(message);
+
+        if (kind === 1 && isKeyframe && state.waitingForKeyframe) {
+          state.waitingForKeyframe = false;
+          viewer.serializeAttachment(state);
+        }
+      } catch {
         if (kind === 1) {
           state.waitingForKeyframe = true;
           try { viewer.serializeAttachment(state); } catch { }
@@ -97,13 +143,13 @@ export class RoomRelay extends DurableObject<Env> {
     }
   }
 
-  async webSocketClose(ws: WebSocket) {
+  async webSocketClose(ws: WebSocket, _code: number, _reason: string, _wasClean: boolean) {
     const attachment = (ws.deserializeAttachment() ?? {}) as Partial<Attachment>;
     if (attachment.role === 'publisher') await this.ctx.storage.delete('streamConfig');
     await this.publishRoomState();
   }
 
-  async webSocketError() {
+  async webSocketError(_ws: WebSocket, _error: unknown) {
     await this.publishRoomState();
   }
 
@@ -128,6 +174,7 @@ export class RoomRelay extends DurableObject<Env> {
         try { viewer.send(streamConfig); } catch { }
       }
     }
+
     for (const publisher of publishers) {
       json(publisher, { type: 'viewer-count', count: viewers.length });
     }
@@ -139,10 +186,9 @@ export default {
     const url = new URL(request.url);
 
     if (url.pathname === '/health' || url.pathname === '/relay/health') {
-      return Response.json({ ok: true, service: 'AKTela Relay', protocol: 4 });
+      return Response.json({ ok: true, service: 'AKTela Relay', protocol: 4, transport: 'text-fallback-v2' });
     }
 
-    // Aceitamos os dois formatos para funcionar tanto diretamente quanto pelo URL Mapping do Discord.
     const websocketPath = url.pathname === '/ws' || url.pathname === '/relay' || url.pathname === '/relay/ws';
     if (!websocketPath) return new Response('Not found', { status: 404 });
     if (request.method !== 'GET') return new Response('Method not allowed', { status: 405 });
@@ -157,6 +203,7 @@ export default {
     }
 
     const id = env.ROOMS.idFromName(room);
-    return env.ROOMS.get(id).fetch(request);
+    const stub = env.ROOMS.get(id, { locationHint: 'sam' });
+    return stub.fetch(request);
   }
 } satisfies ExportedHandler<Env>;

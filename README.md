@@ -1,11 +1,16 @@
-# AKTela Relay
+# AKTela Relay v2.0
 
-Relay WebSocket do AKTela usando Cloudflare Workers + Durable Objects.
+Relay WebSocket da AKTela em Cloudflare Workers + Durable Objects.
 
-## Discord URL Mapping obrigatório
-No Developer Portal, em **Atividades > Mapeamentos de URL**, mantenha:
+## O que mudou
 
-1. `/relay` -> `aktela-relay.tacito1-filho.workers.dev`
-2. `/` -> domínio da Activity na Vercel
+- Mantém o Capture enviando mídia binária diretamente para a Cloudflare.
+- Viewers da Discord Activity usam `transport=text`.
+- O relay converte cada pacote de mídia em um envelope base64 apenas no trecho Cloudflare -> Discord.
+- Isso contorna clientes/proxies em que mensagens WebSocket binárias não chegam de forma consistente.
+- Mantém suporte ao transporte binário para testes fora do Discord.
+- Usa `locationHint: "sam"` na criação de novas salas para reduzir a latência para usuários da América do Sul quando possível.
 
-O mapeamento `/relay` deve ficar acima de `/`.
+A URL pública continua a mesma:
+
+`https://aktela-relay.tacito1-filho.workers.dev`

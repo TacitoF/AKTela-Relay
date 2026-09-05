@@ -1,4 +1,4 @@
-# AKTela Relay 3.2
+# AKTela Relay 3.2.1
 
 Relay AKV5 em Cloudflare Workers com uma sala por Durable Object.
 
@@ -7,3 +7,4 @@ Relay AKV5 em Cloudflare Workers com uma sala por Durable Object.
 - Sincroniza novos espectadores somente com um quadro-chave atual, evitando congelamentos e artefatos causados por referências antigas.
 - Informa imediatamente ao Capture os espectadores que já estavam na sala.
 - Valida capabilities e o envelope binário antes de retransmitir mídia.
+- Encaminha sondas de latência de ponta a ponta entre Capture e espectadores.

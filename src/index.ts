@@ -29,6 +29,7 @@ type ControlMessage = {
   protocol?: number;
   modes?: ViewerCapabilities['modes'];
   audioOpus?: boolean;
+  reason?: string;
 };
 
 const ROOM_RE = /^[A-Z2-9]{6}$/;
@@ -179,7 +180,7 @@ export class RoomRelay extends DurableObject<Env> {
         }
 
         if (control.type === 'request-keyframe') {
-          this.requestKeyframe(control.type);
+          this.requestKeyframe(control.reason ?? 'viewer-request');
           const state = attachment as Attachment;
           state.waitingForKeyframe = true;
           ws.serializeAttachment(state);
@@ -426,7 +427,7 @@ export default {
         ok: true,
         service: 'AKTela Relay',
         protocol: 5,
-        stability: 'v2',
+        stability: 'v2.1',
         features: ['single-publisher', 'same-client-reconnect', 'capability-negotiation', 'keyframe-cache', 'hibernation-heartbeat', 'text-media-fallback']
       });
     }

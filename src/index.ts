@@ -72,8 +72,6 @@ function tokenParts(token: CapabilityToken) {
 }
 
 export class RoomRelay extends DurableObject<Env> {
-  private lastVideoKeyframe: ArrayBuffer | null = null;
-  private lastVideoKeyframeText: string | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -120,8 +118,6 @@ export class RoomRelay extends DurableObject<Env> {
 
       if (active.length === 0) {
         await this.ctx.storage.delete('streamConfig');
-        this.lastVideoKeyframe = null;
-        this.lastVideoKeyframeText = null;
       }
     } else {
       // Reconexão do mesmo espectador não deve ser contada duas vezes.
@@ -148,8 +144,9 @@ export class RoomRelay extends DurableObject<Env> {
 
     if (role === 'viewer') {
       await this.syncViewer(server);
-      await this.publishAudienceCapabilities();
     }
+    // A Capture joining existing viewers needs their capabilities immediately.
+    await this.publishAudienceCapabilities();
 
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -168,10 +165,16 @@ export class RoomRelay extends DurableObject<Env> {
 
       if (attachment.role === 'viewer') {
         if (control.type === 'viewer-capabilities') {
+          if (control.protocol !== 5 || !control.modes || typeof control.modes !== 'object') return;
+          const modes: ViewerCapabilities['modes'] = {};
+          for (const mode of MODE_ORDER) {
+            const tokens = control.modes[mode];
+            modes[mode] = Array.isArray(tokens) ? TOKEN_ORDER.filter(token => tokens.includes(token)) : [];
+          }
           const state = attachment as Attachment;
           state.capabilities = {
             protocol: 5,
-            modes: control.modes ?? {},
+            modes,
             audioOpus: control.audioOpus
           };
           ws.serializeAttachment(state);
@@ -188,6 +191,9 @@ export class RoomRelay extends DurableObject<Env> {
         }
 
         if (control.type === 'decoder-error') {
+          const state = attachment as Attachment;
+          state.waitingForKeyframe = true;
+          ws.serializeAttachment(state);
           this.requestKeyframe('decoder-error');
           return;
         }
@@ -199,8 +205,6 @@ export class RoomRelay extends DurableObject<Env> {
 
       if (control.type === 'stream-config') {
         await this.ctx.storage.put('streamConfig', message);
-        this.lastVideoKeyframe = null;
-        this.lastVideoKeyframeText = null;
         this.markViewersWaiting();
         this.broadcastText(message);
         return;
@@ -221,6 +225,8 @@ export class RoomRelay extends DurableObject<Env> {
     for (let i = 0; i < MAGIC.length; i++) if (bytes[i] !== MAGIC[i]) return;
 
     const kind = bytes[5];
+    const payloadLength = new DataView(message).getInt32(20, true);
+    if (bytes[4] !== 5 || (kind !== 1 && kind !== 2) || payloadLength <= 0 || payloadLength !== bytes.byteLength - 24) return;
     const isKeyframe = (bytes[6] & 1) !== 0;
     const viewers = this.ctx.getWebSockets('viewer').filter(v => v.readyState === WebSocket.OPEN);
     if (viewers.length === 0) return;
@@ -231,11 +237,6 @@ export class RoomRelay extends DurableObject<Env> {
       return state.transport === 'text';
     });
     if (textViewerExists) textEnvelope = TEXT_MEDIA_PREFIX + toBase64(message);
-
-    if (kind === 1 && isKeyframe) {
-      this.lastVideoKeyframe = message.slice(0);
-      this.lastVideoKeyframeText = textEnvelope ?? TEXT_MEDIA_PREFIX + toBase64(message);
-    }
 
     for (const viewer of viewers) {
       const state = (viewer.deserializeAttachment() ?? {
@@ -270,8 +271,6 @@ export class RoomRelay extends DurableObject<Env> {
       const replacementExists = this.ctx.getWebSockets('publisher').some(other => other !== ws && other.readyState === WebSocket.OPEN);
       if (!replacementExists) {
         await this.ctx.storage.delete('streamConfig');
-        this.lastVideoKeyframe = null;
-        this.lastVideoKeyframeText = null;
       }
     }
     await this.publishRoomState();
@@ -283,8 +282,6 @@ export class RoomRelay extends DurableObject<Env> {
     if (attachment.role === 'publisher') {
       const replacementExists = this.ctx.getWebSockets('publisher').some(other => other !== ws && other.readyState === WebSocket.OPEN);
       if (!replacementExists) {
-        this.lastVideoKeyframe = null;
-        this.lastVideoKeyframeText = null;
       }
     }
     await this.publishRoomState();
@@ -298,17 +295,8 @@ export class RoomRelay extends DurableObject<Env> {
       try { viewer.send(streamConfig); } catch { }
     }
 
-    const state = (viewer.deserializeAttachment() ?? {}) as Attachment;
-    if (this.lastVideoKeyframe) {
-      try {
-        if (state.transport === 'text') viewer.send(this.lastVideoKeyframeText ?? TEXT_MEDIA_PREFIX + toBase64(this.lastVideoKeyframe));
-        else viewer.send(this.lastVideoKeyframe);
-        state.waitingForKeyframe = false;
-        viewer.serializeAttachment(state);
-        return;
-      } catch { }
-    }
-
+    // A cached IDR cannot decode current deltas when intervening reference frames
+    // were never delivered. Keep this viewer waiting for a fresh live keyframe.
     this.requestKeyframe('viewer-joined');
   }
 
@@ -427,8 +415,8 @@ export default {
         ok: true,
         service: 'AKTela Relay',
         protocol: 5,
-        stability: 'v2.2',
-        features: ['single-publisher', 'same-client-reconnect', 'capability-negotiation', 'keyframe-cache', 'hibernation-heartbeat', 'text-media-fallback']
+        stability: 'v2.3',
+        features: ['single-publisher', 'same-client-reconnect', 'capability-negotiation', 'fresh-keyframe-sync', 'hibernation-heartbeat', 'text-media-fallback']
       });
     }
 

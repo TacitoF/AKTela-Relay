@@ -1,3 +1,9 @@
-# AKTela Relay — Stability v2.2
+# AKTela Relay 3.2
 
-Mantém o protocolo AKV5, um publisher por sala, Durable Objects, keyframe cache e negociação agregada. A preferência comum de codec passa a ser H.264 Main antes de Baseline para combinar melhor com os encoders Windows/NVENC, sem selecionar um perfil que o espectador não tenha anunciado como suportado.
+Relay AKV5 em Cloudflare Workers com uma sala por Durable Object.
+
+- Garante um único transmissor por sala e permite a reconexão da mesma sessão.
+- Agrega os codecs suportados por todos os espectadores e informa o modo comum ao Capture.
+- Sincroniza novos espectadores somente com um quadro-chave atual, evitando congelamentos e artefatos causados por referências antigas.
+- Informa imediatamente ao Capture os espectadores que já estavam na sala.
+- Valida capabilities e o envelope binário antes de retransmitir mídia.

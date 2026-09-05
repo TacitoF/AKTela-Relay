@@ -36,7 +36,7 @@ const ROOM_RE = /^[A-Z2-9]{6}$/;
 const MAGIC = [65, 75, 86, 53]; // AKV5
 const TEXT_MEDIA_PREFIX = '@media:';
 const MODE_ORDER: ModeKey[] = ['1080p60', '1080p30', '720p60', '720p30'];
-const TOKEN_ORDER: CapabilityToken[] = ['h264-baseline', 'h264-main', 'h264-high', 'vp8'];
+const TOKEN_ORDER: CapabilityToken[] = ['h264-main', 'h264-baseline', 'h264-high', 'vp8'];
 
 function json(ws: WebSocket, value: unknown) {
   if (ws.readyState !== WebSocket.OPEN) return;
@@ -363,8 +363,8 @@ export class RoomRelay extends DurableObject<Env> {
           ready: true,
           modeKey: '720p30',
           videoCodec: 'h264',
-          videoProfile: 'baseline',
-          codecString: 'avc1.42E01F',
+          videoProfile: 'main',
+          codecString: 'avc1.4D401F',
           compatibilityMode: false,
           reason: 'sem espectadores'
         });
@@ -376,7 +376,7 @@ export class RoomRelay extends DurableObject<Env> {
     const readyViewers = caps.length;
 
     let modeKey: ModeKey = '720p30';
-    let selected: CapabilityToken = 'h264-baseline';
+    let selected: CapabilityToken = 'h264-main';
     let reason = readyViewers === viewers.length ? 'recursos negociados' : 'aguardando recursos dos espectadores';
     let ready = readyViewers === viewers.length;
 
@@ -395,7 +395,7 @@ export class RoomRelay extends DurableObject<Env> {
       if (!found) {
         ready = false;
         modeKey = '720p30';
-        selected = 'h264-baseline';
+        selected = 'h264-main';
         reason = 'nenhum codec comum confirmado; modo compatibilidade';
       }
     }
@@ -427,7 +427,7 @@ export default {
         ok: true,
         service: 'AKTela Relay',
         protocol: 5,
-        stability: 'v2.1',
+        stability: 'v2.2',
         features: ['single-publisher', 'same-client-reconnect', 'capability-negotiation', 'keyframe-cache', 'hibernation-heartbeat', 'text-media-fallback']
       });
     }

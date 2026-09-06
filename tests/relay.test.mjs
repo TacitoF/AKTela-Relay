@@ -46,16 +46,17 @@ function fixture() {
   };
   return { ctx, room: new RoomRelay(ctx, {}), sockets };
 }
-function viewer(ctx, id) {
+function viewer(ctx, id, streamId) {
   const ws = new Socket();
   ws.serializeAttachment({ role: 'viewer', transport: 'binary', connectionId: id, waitingForKeyframe: true,
+    streamId,
     capabilities: { protocol: 5, modes: { '720p30': ['h264-main'] } } });
   ctx.acceptWebSocket(ws, ['viewer']);
   return ws;
 }
-function packet(key, length = 1) {
+function packet(key, length = 1, kind = 1) {
   const bytes = new Uint8Array(24 + length);
-  bytes.set([65, 75, 86, 53, 5, 1, key ? 1 : 0]);
+  bytes.set([65, 75, 86, 53, 5, kind, key ? 1 : 0]);
   new DataView(bytes.buffer).setInt32(20, length, true);
   return bytes.buffer;
 }
@@ -97,12 +98,59 @@ test('malformed capabilities are sanitized and invalid media is not broadcast', 
   assert.equal(v.sent.filter(m => m instanceof ArrayBuffer).length, 0);
 });
 
-test('second publisher is rejected without replacing the active session', async () => {
+test('three publishers are accepted and the fourth is rejected', async () => {
   const { room, ctx } = fixture();
   await room.fetch(new Request('https://relay/ws?role=publisher&publisherId=first'));
   await room.fetch(new Request('https://relay/ws?role=publisher&publisherId=second'));
-  assert.equal(ctx.getWebSockets('publisher').length, 1);
+  await room.fetch(new Request('https://relay/ws?role=publisher&publisherId=third'));
+  await room.fetch(new Request('https://relay/ws?role=publisher&publisherId=fourth'));
+  assert.equal(ctx.getWebSockets('publisher').filter(ws => ws.readyState === WebSocket.OPEN).length, 3);
   assert.ok(messages(ctx.getWebSockets('rejected')[0]).some(m => m.type === 'publisher-rejected'));
+});
+
+test('media and capabilities are isolated by stream', async () => {
+  const { room, ctx } = fixture();
+  await room.fetch(new Request('https://relay/ws?role=publisher&publisherId=first'));
+  await room.fetch(new Request('https://relay/ws?role=publisher&publisherId=second'));
+  const [first, second] = ctx.getWebSockets('publisher');
+  const firstViewer = viewer(ctx, 'viewer-a', 'first');
+  const secondViewer = viewer(ctx, 'viewer-b', 'second');
+
+  await room.webSocketMessage(first, packet(true));
+  assert.equal(firstViewer.sent.filter(m => m instanceof ArrayBuffer).length, 1);
+  assert.equal(secondViewer.sent.filter(m => m instanceof ArrayBuffer).length, 0);
+
+  await room.webSocketMessage(secondViewer, JSON.stringify({ type: 'viewer-capabilities', protocol: 5, modes: { '720p30': ['vp8'] } }));
+  const capabilityMessages = messages(second).filter(m => m.type === 'audience-capabilities');
+  assert.ok(capabilityMessages.some(m => m.viewers === 1 && m.videoCodec === 'vp8'));
+});
+
+test('observer receives the ordered stream list and multi-screen quality policy', async () => {
+  const { room, ctx } = fixture();
+  await room.fetch(new Request('https://relay/ws?role=viewer&viewerId=observer&observe=1'));
+  const observer = ctx.getWebSockets('observer')[0];
+  await room.fetch(new Request('https://relay/ws?role=publisher&publisherId=first'));
+  await room.fetch(new Request('https://relay/ws?role=publisher&publisherId=second'));
+
+  const list = messages(observer).filter(m => m.type === 'stream-list').at(-1);
+  assert.deepEqual(list.streams.map(stream => stream.id), ['first', 'second']);
+  for (const publisher of ctx.getWebSockets('publisher')) {
+    assert.ok(messages(publisher).some(m => m.type === 'room-policy' && m.activeStreams === 2 && m.maxModeKey === '720p30'));
+  }
+});
+
+test('muted grid viewer does not receive audio until it enables it', async () => {
+  const { room, ctx } = fixture();
+  await room.fetch(new Request('https://relay/ws?role=publisher&publisherId=first'));
+  await room.fetch(new Request('https://relay/ws?role=viewer&viewerId=grid&streamId=first&audio=0'));
+  const publisher = ctx.getWebSockets('publisher')[0];
+  const gridViewer = ctx.getWebSockets('viewer')[0];
+
+  await room.webSocketMessage(publisher, packet(true, 1, 2));
+  assert.equal(gridViewer.sent.filter(m => m instanceof ArrayBuffer).length, 0);
+  await room.webSocketMessage(gridViewer, JSON.stringify({ type: 'set-audio', enabled: true }));
+  await room.webSocketMessage(publisher, packet(true, 1, 2));
+  assert.equal(gridViewer.sent.filter(m => m instanceof ArrayBuffer).length, 1);
 });
 
 test('latency probe makes a full publisher-viewer-publisher round trip', async () => {

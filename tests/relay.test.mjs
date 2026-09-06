@@ -104,3 +104,14 @@ test('second publisher is rejected without replacing the active session', async 
   assert.equal(ctx.getWebSockets('publisher').length, 1);
   assert.ok(messages(ctx.getWebSockets('rejected')[0]).some(m => m.type === 'publisher-rejected'));
 });
+
+test('latency probe makes a full publisher-viewer-publisher round trip', async () => {
+  const { room, ctx } = fixture();
+  const v = viewer(ctx, 'viewer');
+  await room.fetch(new Request('https://relay/ws?role=publisher&publisherId=capture'));
+  const publisher = ctx.getWebSockets('publisher')[0];
+  await room.webSocketMessage(publisher, JSON.stringify({ type: 'latency-probe', sentAt: 12345 }));
+  assert.ok(messages(v).some(m => m.type === 'latency-probe' && m.sentAt === 12345));
+  await room.webSocketMessage(v, JSON.stringify({ type: 'latency-probe-ack', sentAt: 12345 }));
+  assert.ok(messages(publisher).some(m => m.type === 'latency-probe-ack' && m.sentAt === 12345));
+});

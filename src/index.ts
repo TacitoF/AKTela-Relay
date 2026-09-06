@@ -164,6 +164,13 @@ export class RoomRelay extends DurableObject<Env> {
       }
 
       if (attachment.role === 'viewer') {
+        if (control.type === 'latency-probe-ack' && Number.isSafeInteger(control.sentAt) && control.sentAt! >= 0) {
+          for (const publisher of this.ctx.getWebSockets('publisher')) {
+            json(publisher, { type: 'latency-probe-ack', sentAt: control.sentAt });
+          }
+          return;
+        }
+
         if (control.type === 'viewer-capabilities') {
           if (control.protocol !== 5 || !control.modes || typeof control.modes !== 'object') return;
           const modes: ViewerCapabilities['modes'] = {};
@@ -212,6 +219,13 @@ export class RoomRelay extends DurableObject<Env> {
 
       if (control.type === 'cursor') {
         this.broadcastText(message);
+        return;
+      }
+
+      if (control.type === 'latency-probe' && Number.isSafeInteger(control.sentAt) && control.sentAt! >= 0) {
+        for (const viewer of this.ctx.getWebSockets('viewer')) {
+          json(viewer, { type: 'latency-probe', sentAt: control.sentAt });
+        }
         return;
       }
 

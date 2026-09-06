@@ -22,6 +22,7 @@ type Attachment = {
   connectionId: string;
   streamId?: string;
   slot?: number;
+  publisherName?: string;
   receiveAudio?: boolean;
   capabilities?: ViewerCapabilities;
 };
@@ -39,6 +40,10 @@ type ControlMessage = {
 const ROOM_RE = /^[A-Z2-9]{6}$/;
 const STREAM_RE = /^[A-Za-z0-9_-]{1,96}$/;
 const MAGIC = [65, 75, 86, 53]; // AKV5
+const BATCH_MAGIC = [65, 75, 66, 49]; // AKB1
+const MEDIA_HEADER = 24;
+const BATCH_HEADER = 8;
+const MAX_BATCH_PACKETS = 32;
 const TEXT_MEDIA_PREFIX = '@media:';
 const MAX_STREAMS = 3;
 const MODE_ORDER: ModeKey[] = ['1080p60', '1080p30', '720p60', '720p30'];
@@ -77,6 +82,67 @@ function tokenParts(token: CapabilityToken) {
   return { videoCodec: 'h264', videoProfile: token.replace('h264-', '') };
 }
 
+type MediaPacket = { buffer: ArrayBuffer; kind: 1 | 2; keyframe: boolean };
+
+function normalizePublisherName(value: string | null) {
+  const clean = (value ?? '').replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim();
+  return (clean || 'Transmissor').slice(0, 32);
+}
+
+function parsePacket(buffer: ArrayBuffer): MediaPacket | null {
+  const bytes = new Uint8Array(buffer);
+  if (bytes.byteLength < MEDIA_HEADER) return null;
+  for (let i = 0; i < MAGIC.length; i++) if (bytes[i] !== MAGIC[i]) return null;
+  const kind = bytes[5];
+  const payloadLength = new DataView(buffer).getInt32(20, true);
+  if (bytes[4] !== 5 || (kind !== 1 && kind !== 2) || payloadLength <= 0 || payloadLength !== bytes.byteLength - MEDIA_HEADER) return null;
+  return { buffer, kind, keyframe: kind === 1 && (bytes[6] & 1) !== 0 };
+}
+
+function parseMediaMessage(message: ArrayBuffer): MediaPacket[] | null {
+  const single = parsePacket(message);
+  if (single) return [single];
+
+  const bytes = new Uint8Array(message);
+  if (bytes.byteLength < BATCH_HEADER) return null;
+  for (let i = 0; i < BATCH_MAGIC.length; i++) if (bytes[i] !== BATCH_MAGIC[i]) return null;
+  const view = new DataView(message);
+  const count = view.getUint16(6, true);
+  if (bytes[4] !== 1 || count < 1 || count > MAX_BATCH_PACKETS) return null;
+
+  const packets: MediaPacket[] = [];
+  let offset = BATCH_HEADER;
+  for (let i = 0; i < count; i++) {
+    if (offset + 4 > bytes.byteLength) return null;
+    const length = view.getInt32(offset, true);
+    offset += 4;
+    if (length < MEDIA_HEADER || offset + length > bytes.byteLength) return null;
+    const packet = parsePacket(message.slice(offset, offset + length));
+    if (!packet) return null;
+    packets.push(packet);
+    offset += length;
+  }
+  return offset === bytes.byteLength ? packets : null;
+}
+
+function createMediaMessage(packets: MediaPacket[]): ArrayBuffer {
+  if (packets.length === 1) return packets[0].buffer;
+  const length = BATCH_HEADER + packets.reduce((total, packet) => total + 4 + packet.buffer.byteLength, 0);
+  const output = new ArrayBuffer(length);
+  const bytes = new Uint8Array(output);
+  bytes.set(BATCH_MAGIC, 0);
+  bytes[4] = 1;
+  new DataView(output).setUint16(6, packets.length, true);
+  let offset = BATCH_HEADER;
+  for (const packet of packets) {
+    new DataView(output).setInt32(offset, packet.buffer.byteLength, true);
+    offset += 4;
+    bytes.set(new Uint8Array(packet.buffer), offset);
+    offset += packet.buffer.byteLength;
+  }
+  return output;
+}
+
 export class RoomRelay extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -105,6 +171,7 @@ export class RoomRelay extends DurableObject<Env> {
     const [client, server] = Object.values(pair);
     let streamId = requestedStreamId;
     let slot: number | undefined;
+    const publisherName = role === 'publisher' ? normalizePublisherName(url.searchParams.get('publisherName')) : undefined;
 
     if (role === 'publisher') {
       streamId = connectionId;
@@ -147,10 +214,11 @@ export class RoomRelay extends DurableObject<Env> {
       connectionId,
       streamId,
       slot,
+      publisherName,
       receiveAudio: role === 'viewer' ? url.searchParams.get('audio') !== '0' : false
     } satisfies Attachment);
 
-    json(server, { type: 'hello', role, protocol: 5, roomProtocol: 2, transport });
+    json(server, { type: 'hello', role, protocol: 5, roomProtocol: 3, transport });
     if (role === 'publisher') {
       json(server, {
         type: 'publisher-accepted', protocol: 5, streamId, slot, activeStreams: this.publishers().length, maxStreams: MAX_STREAMS,
@@ -238,33 +306,32 @@ export class RoomRelay extends DurableObject<Env> {
     }
 
     if (attachment.role !== 'publisher' || !attachment.streamId) return;
-    const bytes = new Uint8Array(message);
-    if (bytes.byteLength < 24) return;
-    for (let i = 0; i < MAGIC.length; i++) if (bytes[i] !== MAGIC[i]) return;
-
-    const kind = bytes[5];
-    const payloadLength = new DataView(message).getInt32(20, true);
-    if (bytes[4] !== 5 || (kind !== 1 && kind !== 2) || payloadLength <= 0 || payloadLength !== bytes.byteLength - 24) return;
-
-    const isKeyframe = (bytes[6] & 1) !== 0;
+    const packets = parseMediaMessage(message);
+    if (!packets) return;
     const viewers = this.viewers(attachment.streamId);
     if (viewers.length === 0) return;
 
-    let textEnvelope: string | null = null;
-    if (viewers.some(v => this.state(v).transport === 'text')) textEnvelope = TEXT_MEDIA_PREFIX + toBase64(message);
-
     for (const viewer of viewers) {
       const state = this.state(viewer);
-      if (kind === 2 && state.receiveAudio === false) continue;
-      if (kind === 1 && state.waitingForKeyframe && !isKeyframe) continue;
+      let selected = state.receiveAudio === false ? packets.filter(packet => packet.kind !== 2) : packets;
+      if (state.waitingForKeyframe) {
+        const keyframeIndex = selected.findIndex(packet => packet.kind === 1 && packet.keyframe);
+        selected = keyframeIndex >= 0
+          ? selected.slice(keyframeIndex)
+          : selected.filter(packet => packet.kind === 2);
+      }
+      if (selected.length === 0) continue;
+      const outbound = selected.length === packets.length && selected.every((packet, index) => packet === packets[index])
+        ? message
+        : createMediaMessage(selected);
       try {
-        viewer.send(state.transport === 'text' ? textEnvelope! : message);
-        if (kind === 1 && isKeyframe && state.waitingForKeyframe) {
+        viewer.send(state.transport === 'text' ? TEXT_MEDIA_PREFIX + toBase64(outbound) : outbound);
+        if (selected.some(packet => packet.kind === 1 && packet.keyframe) && state.waitingForKeyframe) {
           state.waitingForKeyframe = false;
           viewer.serializeAttachment(state);
         }
       } catch {
-        if (kind === 1) {
+        if (selected.some(packet => packet.kind === 1)) {
           state.waitingForKeyframe = true;
           try { viewer.serializeAttachment(state); } catch { }
         }
@@ -378,7 +445,10 @@ export class RoomRelay extends DurableObject<Env> {
   private publishStreamList() {
     const streams = this.publishers().map(ws => {
       const state = this.state(ws);
-      return { id: state.streamId!, slot: state.slot ?? 1, label: `Tela ${state.slot ?? 1}` };
+      return {
+        id: state.streamId!, slot: state.slot ?? 1, label: `Tela ${state.slot ?? 1}`,
+        publisherName: state.publisherName ?? 'Transmissor'
+      };
     }).sort((a, b) => a.slot - b.slot);
     const message = { type: 'stream-list', streams, maxStreams: MAX_STREAMS };
     for (const observer of this.ctx.getWebSockets('observer')) json(observer, message);
@@ -444,8 +514,8 @@ export default {
     const url = new URL(request.url);
     if (url.pathname === '/health' || url.pathname === '/relay/health') {
       return Response.json({
-        ok: true, service: 'AKTela Relay', protocol: 5, roomProtocol: 2, stability: 'v2.4',
-        features: ['three-publishers', 'selective-subscriptions', 'stream-discovery', 'room-quality-policy', 'capability-negotiation', 'fresh-keyframe-sync', 'hibernation-heartbeat', 'text-media-fallback']
+        ok: true, service: 'AKTela Relay', protocol: 5, roomProtocol: 3, stability: 'v2.5',
+        features: ['batched-media', 'publisher-names', 'three-publishers', 'selective-subscriptions', 'stream-discovery', 'room-quality-policy', 'capability-negotiation', 'fresh-keyframe-sync', 'hibernation-heartbeat', 'text-media-fallback']
       });
     }
 

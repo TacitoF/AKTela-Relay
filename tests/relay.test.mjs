@@ -60,6 +60,22 @@ function packet(key, length = 1, kind = 1) {
   new DataView(bytes.buffer).setInt32(20, length, true);
   return bytes.buffer;
 }
+function batch(...packets) {
+  const length = 8 + packets.reduce((total, value) => total + 4 + value.byteLength, 0);
+  const buffer = new ArrayBuffer(length);
+  const bytes = new Uint8Array(buffer);
+  bytes.set([65, 75, 66, 49, 1, 0]);
+  const view = new DataView(buffer);
+  view.setUint16(6, packets.length, true);
+  let offset = 8;
+  for (const value of packets) {
+    view.setInt32(offset, value.byteLength, true);
+    offset += 4;
+    bytes.set(new Uint8Array(value), offset);
+    offset += value.byteLength;
+  }
+  return buffer;
+}
 const messages = ws => ws.sent.filter(s => typeof s === 'string').map(s => JSON.parse(s));
 
 test('publisher receives capabilities of viewers already in the room', async () => {
@@ -129,14 +145,43 @@ test('observer receives the ordered stream list and multi-screen quality policy'
   const { room, ctx } = fixture();
   await room.fetch(new Request('https://relay/ws?role=viewer&viewerId=observer&observe=1'));
   const observer = ctx.getWebSockets('observer')[0];
-  await room.fetch(new Request('https://relay/ws?role=publisher&publisherId=first'));
-  await room.fetch(new Request('https://relay/ws?role=publisher&publisherId=second'));
+  await room.fetch(new Request('https://relay/ws?role=publisher&publisherId=first&publisherName=T%C3%A1cito'));
+  await room.fetch(new Request('https://relay/ws?role=publisher&publisherId=second&publisherName=Isabele'));
 
   const list = messages(observer).filter(m => m.type === 'stream-list').at(-1);
   assert.deepEqual(list.streams.map(stream => stream.id), ['first', 'second']);
+  assert.deepEqual(list.streams.map(stream => stream.publisherName), ['Tácito', 'Isabele']);
   for (const publisher of ctx.getWebSockets('publisher')) {
     assert.ok(messages(publisher).some(m => m.type === 'room-policy' && m.activeStreams === 2 && m.maxModeKey === '720p30'));
   }
+});
+
+test('batched media uses one relay message and preserves keyframe recovery', async () => {
+  const { room, ctx } = fixture();
+  await room.fetch(new Request('https://relay/ws?role=publisher&publisherId=first'));
+  await room.fetch(new Request('https://relay/ws?role=viewer&viewerId=viewer&streamId=first'));
+  const publisher = ctx.getWebSockets('publisher')[0];
+  const target = ctx.getWebSockets('viewer')[0];
+
+  await room.webSocketMessage(publisher, batch(packet(false), packet(true), packet(false), packet(true, 1, 2)));
+  const media = target.sent.filter(value => value instanceof ArrayBuffer);
+  assert.equal(media.length, 1, 'um lote deve atravessar o Relay em uma única mensagem');
+  assert.deepEqual(Array.from(new Uint8Array(media[0]).slice(0, 4)), [65, 75, 66, 49]);
+  assert.equal(new DataView(media[0]).getUint16(6, true), 3, 'delta anterior ao primeiro IDR deve ser removido');
+  assert.equal(target.deserializeAttachment().waitingForKeyframe, false);
+});
+
+test('batched media removes audio for muted grid viewers', async () => {
+  const { room, ctx } = fixture();
+  await room.fetch(new Request('https://relay/ws?role=publisher&publisherId=first'));
+  await room.fetch(new Request('https://relay/ws?role=viewer&viewerId=grid&streamId=first&audio=0'));
+  const publisher = ctx.getWebSockets('publisher')[0];
+  const target = ctx.getWebSockets('viewer')[0];
+
+  await room.webSocketMessage(publisher, batch(packet(true, 1, 2), packet(true), packet(false)));
+  const media = target.sent.filter(value => value instanceof ArrayBuffer);
+  assert.equal(media.length, 1);
+  assert.equal(new DataView(media[0]).getUint16(6, true), 2);
 });
 
 test('muted grid viewer does not receive audio until it enables it', async () => {

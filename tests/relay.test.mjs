@@ -198,6 +198,54 @@ test('muted grid viewer does not receive audio until it enables it', async () =>
   assert.equal(gridViewer.sent.filter(m => m instanceof ArrayBuffer).length, 1);
 });
 
+test('hidden viewer stops receiving video and resumes only from a fresh keyframe', async () => {
+  const { room, ctx } = fixture();
+  await room.fetch(new Request('https://relay/ws?role=publisher&publisherId=first'));
+  await room.fetch(new Request('https://relay/ws?role=viewer&viewerId=viewer&streamId=first'));
+  const publisher = ctx.getWebSockets('publisher')[0];
+  const target = ctx.getWebSockets('viewer')[0];
+
+  await room.webSocketMessage(target, JSON.stringify({ type: 'set-video', enabled: false }));
+  assert.ok(messages(publisher).some(message => message.type === 'viewer-demand' && message.videoViewers === 0 && message.audioViewers === 1));
+  await room.webSocketMessage(publisher, batch(packet(true), packet(true, 1, 2)));
+  const hiddenMedia = target.sent.filter(value => value instanceof ArrayBuffer);
+  assert.equal(hiddenMedia.length, 1);
+  assert.equal(new Uint8Array(hiddenMedia[0])[5], 2, 'áudio deve continuar disponível com a Activity oculta');
+
+  target.sent.length = 0;
+  await room.webSocketMessage(target, JSON.stringify({ type: 'set-video', enabled: true }));
+  assert.ok(messages(publisher).some(message => message.type === 'request-keyframe' && message.reason === 'viewer-visible'));
+  assert.ok(messages(publisher).some(message => message.type === 'viewer-demand' && message.videoViewers === 1));
+  await room.webSocketMessage(publisher, packet(false));
+  assert.equal(target.sent.filter(value => value instanceof ArrayBuffer).length, 0);
+  await room.webSocketMessage(publisher, packet(true));
+  assert.equal(target.sent.filter(value => value instanceof ArrayBuffer).length, 1);
+});
+
+test('viewer health is sanitized, aggregated and ignores paused video', async () => {
+  const { room, ctx } = fixture();
+  await room.fetch(new Request('https://relay/ws?role=publisher&publisherId=first'));
+  await room.fetch(new Request('https://relay/ws?role=viewer&viewerId=viewer&streamId=first'));
+  const publisher = ctx.getWebSockets('publisher')[0];
+  const target = ctx.getWebSockets('viewer')[0];
+
+  await room.webSocketMessage(target, JSON.stringify({
+    type: 'viewer-health', decodedFps: 999, decodeQueue: -3, dropped: 4, resets: 2,
+    audioBufferMs: 55, audioUnderflows: 3, stalled: true
+  }));
+  const health = messages(publisher).filter(message => message.type === 'viewer-health').at(-1);
+  assert.equal(health.reporting, 1);
+  assert.equal(health.minDecodedFps, 240);
+  assert.equal(health.maxDecodeQueue, 0);
+  assert.equal(health.audioBufferMs, 55);
+  assert.equal(health.stalled, true);
+
+  await room.webSocketMessage(target, JSON.stringify({ type: 'set-video', enabled: false }));
+  const paused = messages(publisher).filter(message => message.type === 'viewer-health').at(-1);
+  assert.equal(paused.reporting, 0);
+  assert.equal(paused.stalled, false);
+});
+
 test('latency probe makes a full publisher-viewer-publisher round trip', async () => {
   const { room, ctx } = fixture();
   const v = viewer(ctx, 'viewer');

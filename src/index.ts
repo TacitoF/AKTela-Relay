@@ -15,6 +15,17 @@ type ViewerCapabilities = {
   audioOpus?: boolean;
 };
 
+type ViewerHealth = {
+  updatedAt: number;
+  decodedFps: number;
+  decodeQueue: number;
+  dropped: number;
+  resets: number;
+  audioBufferMs: number;
+  audioUnderflows: number;
+  stalled: boolean;
+};
+
 type Attachment = {
   role: Role;
   waitingForKeyframe: boolean;
@@ -24,7 +35,9 @@ type Attachment = {
   slot?: number;
   publisherName?: string;
   receiveAudio?: boolean;
+  receiveVideo?: boolean;
   capabilities?: ViewerCapabilities;
+  health?: ViewerHealth;
 };
 
 type ControlMessage = {
@@ -35,6 +48,13 @@ type ControlMessage = {
   audioOpus?: boolean;
   reason?: string;
   enabled?: boolean;
+  decodedFps?: number;
+  decodeQueue?: number;
+  dropped?: number;
+  resets?: number;
+  audioBufferMs?: number;
+  audioUnderflows?: number;
+  stalled?: boolean;
 };
 
 const ROOM_RE = /^[A-Z2-9]{6}$/;
@@ -82,21 +102,22 @@ function tokenParts(token: CapabilityToken) {
   return { videoCodec: 'h264', videoProfile: token.replace('h264-', '') };
 }
 
-type MediaPacket = { buffer: ArrayBuffer; kind: 1 | 2; keyframe: boolean };
+type MediaPacket = { buffer: ArrayBuffer; offset: number; length: number; kind: 1 | 2; keyframe: boolean };
 
 function normalizePublisherName(value: string | null) {
   const clean = (value ?? '').replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim();
   return (clean || 'Transmissor').slice(0, 32);
 }
 
-function parsePacket(buffer: ArrayBuffer): MediaPacket | null {
-  const bytes = new Uint8Array(buffer);
+function parsePacket(buffer: ArrayBuffer, offset = 0, length = buffer.byteLength - offset): MediaPacket | null {
+  if (offset < 0 || length < MEDIA_HEADER || offset + length > buffer.byteLength) return null;
+  const bytes = new Uint8Array(buffer, offset, length);
   if (bytes.byteLength < MEDIA_HEADER) return null;
   for (let i = 0; i < MAGIC.length; i++) if (bytes[i] !== MAGIC[i]) return null;
   const kind = bytes[5];
-  const payloadLength = new DataView(buffer).getInt32(20, true);
+  const payloadLength = new DataView(buffer, offset, length).getInt32(20, true);
   if (bytes[4] !== 5 || (kind !== 1 && kind !== 2) || payloadLength <= 0 || payloadLength !== bytes.byteLength - MEDIA_HEADER) return null;
-  return { buffer, kind, keyframe: kind === 1 && (bytes[6] & 1) !== 0 };
+  return { buffer, offset, length, kind, keyframe: kind === 1 && (bytes[6] & 1) !== 0 };
 }
 
 function parseMediaMessage(message: ArrayBuffer): MediaPacket[] | null {
@@ -117,7 +138,7 @@ function parseMediaMessage(message: ArrayBuffer): MediaPacket[] | null {
     const length = view.getInt32(offset, true);
     offset += 4;
     if (length < MEDIA_HEADER || offset + length > bytes.byteLength) return null;
-    const packet = parsePacket(message.slice(offset, offset + length));
+    const packet = parsePacket(message, offset, length);
     if (!packet) return null;
     packets.push(packet);
     offset += length;
@@ -126,8 +147,13 @@ function parseMediaMessage(message: ArrayBuffer): MediaPacket[] | null {
 }
 
 function createMediaMessage(packets: MediaPacket[]): ArrayBuffer {
-  if (packets.length === 1) return packets[0].buffer;
-  const length = BATCH_HEADER + packets.reduce((total, packet) => total + 4 + packet.buffer.byteLength, 0);
+  if (packets.length === 1) {
+    const packet = packets[0];
+    return packet.offset === 0 && packet.length === packet.buffer.byteLength
+      ? packet.buffer
+      : packet.buffer.slice(packet.offset, packet.offset + packet.length);
+  }
+  const length = BATCH_HEADER + packets.reduce((total, packet) => total + 4 + packet.length, 0);
   const output = new ArrayBuffer(length);
   const bytes = new Uint8Array(output);
   bytes.set(BATCH_MAGIC, 0);
@@ -135,15 +161,23 @@ function createMediaMessage(packets: MediaPacket[]): ArrayBuffer {
   new DataView(output).setUint16(6, packets.length, true);
   let offset = BATCH_HEADER;
   for (const packet of packets) {
-    new DataView(output).setInt32(offset, packet.buffer.byteLength, true);
+    new DataView(output).setInt32(offset, packet.length, true);
     offset += 4;
-    bytes.set(new Uint8Array(packet.buffer), offset);
-    offset += packet.buffer.byteLength;
+    bytes.set(new Uint8Array(packet.buffer, packet.offset, packet.length), offset);
+    offset += packet.length;
   }
   return output;
 }
 
+function finiteNumber(value: unknown, fallback: number, minimum: number, maximum: number) {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? Math.max(minimum, Math.min(maximum, value))
+    : fallback;
+}
+
 export class RoomRelay extends DurableObject<Env> {
+  private readonly lastHealthPublished = new Map<string, number>();
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('ping', 'pong'));
@@ -215,7 +249,8 @@ export class RoomRelay extends DurableObject<Env> {
       streamId,
       slot,
       publisherName,
-      receiveAudio: role === 'viewer' ? url.searchParams.get('audio') !== '0' : false
+      receiveAudio: role === 'viewer' ? url.searchParams.get('audio') !== '0' : false,
+      receiveVideo: role === 'viewer'
     } satisfies Attachment);
 
     json(server, { type: 'hello', role, protocol: 5, roomProtocol: 3, transport });
@@ -231,6 +266,8 @@ export class RoomRelay extends DurableObject<Env> {
     this.publishRoomPolicy();
     if (role === 'viewer') await this.syncViewer(server);
     await this.publishAudienceCapabilities();
+    const demandStreamId = role === 'viewer' ? this.viewerStreamId(this.state(server)) : streamId;
+    if (demandStreamId) this.publishViewerDemand(demandStreamId);
 
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -275,6 +312,33 @@ export class RoomRelay extends DurableObject<Env> {
         if (control.type === 'set-audio' && typeof control.enabled === 'boolean') {
           attachment.receiveAudio = control.enabled;
           ws.serializeAttachment(attachment);
+          this.publishViewerDemand(streamId);
+          return;
+        }
+
+        if (control.type === 'set-video' && typeof control.enabled === 'boolean') {
+          attachment.receiveVideo = control.enabled;
+          if (control.enabled) attachment.waitingForKeyframe = true;
+          ws.serializeAttachment(attachment);
+          if (control.enabled) this.requestKeyframe(streamId, 'viewer-visible');
+          await this.publishViewerHealth(streamId, true);
+          this.publishViewerDemand(streamId);
+          return;
+        }
+
+        if (control.type === 'viewer-health') {
+          attachment.health = {
+            updatedAt: Date.now(),
+            decodedFps: finiteNumber(control.decodedFps, 0, 0, 240),
+            decodeQueue: Math.round(finiteNumber(control.decodeQueue, 0, 0, 256)),
+            dropped: Math.round(finiteNumber(control.dropped, 0, 0, 2_147_483_647)),
+            resets: Math.round(finiteNumber(control.resets, 0, 0, 2_147_483_647)),
+            audioBufferMs: Math.round(finiteNumber(control.audioBufferMs, 0, 0, 1000)),
+            audioUnderflows: Math.round(finiteNumber(control.audioUnderflows, 0, 0, 2_147_483_647)),
+            stalled: control.stalled === true
+          };
+          ws.serializeAttachment(attachment);
+          await this.publishViewerHealth(streamId);
           return;
         }
 
@@ -311,27 +375,42 @@ export class RoomRelay extends DurableObject<Env> {
     const viewers = this.viewers(attachment.streamId);
     if (viewers.length === 0) return;
 
+    const variants = new Map<string, { selected: MediaPacket[]; outbound: ArrayBuffer; text?: string; hasKeyframe: boolean; hasVideo: boolean }>();
     for (const viewer of viewers) {
       const state = this.state(viewer);
-      let selected = state.receiveAudio === false ? packets.filter(packet => packet.kind !== 2) : packets;
-      if (state.waitingForKeyframe) {
-        const keyframeIndex = selected.findIndex(packet => packet.kind === 1 && packet.keyframe);
-        selected = keyframeIndex >= 0
-          ? selected.slice(keyframeIndex)
-          : selected.filter(packet => packet.kind === 2);
+      const receiveVideo = state.receiveVideo !== false;
+      const receiveAudio = state.receiveAudio !== false;
+      const variantKey = `${receiveVideo ? 1 : 0}${receiveAudio ? 1 : 0}${state.waitingForKeyframe ? 1 : 0}`;
+      let variant = variants.get(variantKey);
+      if (!variant) {
+        let selected = packets.filter(packet => (receiveVideo || packet.kind !== 1) && (receiveAudio || packet.kind !== 2));
+        if (state.waitingForKeyframe && receiveVideo) {
+          const keyframeIndex = selected.findIndex(packet => packet.kind === 1 && packet.keyframe);
+          selected = keyframeIndex >= 0
+            ? selected.slice(keyframeIndex)
+            : selected.filter(packet => packet.kind === 2);
+        }
+        const outbound = selected.length === packets.length && selected.every((packet, index) => packet === packets[index])
+          ? message
+          : selected.length > 0 ? createMediaMessage(selected) : new ArrayBuffer(0);
+        variant = {
+          selected,
+          outbound,
+          hasKeyframe: selected.some(packet => packet.kind === 1 && packet.keyframe),
+          hasVideo: selected.some(packet => packet.kind === 1)
+        };
+        variants.set(variantKey, variant);
       }
-      if (selected.length === 0) continue;
-      const outbound = selected.length === packets.length && selected.every((packet, index) => packet === packets[index])
-        ? message
-        : createMediaMessage(selected);
+      if (variant.selected.length === 0) continue;
       try {
-        viewer.send(state.transport === 'text' ? TEXT_MEDIA_PREFIX + toBase64(outbound) : outbound);
-        if (selected.some(packet => packet.kind === 1 && packet.keyframe) && state.waitingForKeyframe) {
+        if (state.transport === 'text') variant.text ??= TEXT_MEDIA_PREFIX + toBase64(variant.outbound);
+        viewer.send(state.transport === 'text' ? variant.text! : variant.outbound);
+        if (variant.hasKeyframe && state.waitingForKeyframe) {
           state.waitingForKeyframe = false;
           viewer.serializeAttachment(state);
         }
       } catch {
-        if (selected.some(packet => packet.kind === 1)) {
+        if (variant.hasVideo) {
           state.waitingForKeyframe = true;
           try { viewer.serializeAttachment(state); } catch { }
         }
@@ -341,6 +420,7 @@ export class RoomRelay extends DurableObject<Env> {
 
   async webSocketClose(ws: WebSocket, _code: number, _reason: string, _wasClean: boolean) {
     const attachment = this.state(ws);
+    const affectedStreamId = attachment.role === 'viewer' ? this.viewerStreamId(attachment) : attachment.streamId;
     if (attachment.role === 'publisher' && attachment.streamId) {
       const replacementExists = this.publishers(attachment.streamId).some(other => other !== ws);
       if (!replacementExists) await this.ctx.storage.delete(this.configKey(attachment.streamId));
@@ -349,6 +429,12 @@ export class RoomRelay extends DurableObject<Env> {
     this.publishStreamList();
     this.publishRoomPolicy();
     await this.publishAudienceCapabilities();
+    if (affectedStreamId) {
+      await this.publishViewerHealth(affectedStreamId, true);
+      this.publishViewerDemand(affectedStreamId);
+      if (this.publishers(affectedStreamId).length === 0 && this.viewers(affectedStreamId).length === 0)
+        this.lastHealthPublished.delete(affectedStreamId);
+    }
   }
 
   async webSocketError(_ws: WebSocket, _error: unknown) {
@@ -360,7 +446,7 @@ export class RoomRelay extends DurableObject<Env> {
 
   private state(ws: WebSocket): Attachment {
     return (ws.deserializeAttachment() ?? {
-      role: 'viewer', waitingForKeyframe: true, transport: 'text', connectionId: 'legacy', receiveAudio: true
+      role: 'viewer', waitingForKeyframe: true, transport: 'text', connectionId: 'legacy', receiveAudio: true, receiveVideo: true
     }) as Attachment;
   }
 
@@ -462,6 +548,15 @@ export class RoomRelay extends DurableObject<Env> {
     }
   }
 
+  private publishViewerDemand(streamId: string) {
+    const viewers = this.viewers(streamId);
+    const videoViewers = viewers.filter(viewer => this.state(viewer).receiveVideo !== false).length;
+    const audioViewers = viewers.filter(viewer => this.state(viewer).receiveAudio !== false).length;
+    for (const publisher of this.publishers(streamId)) {
+      json(publisher, { type: 'viewer-demand', viewers: viewers.length, videoViewers, audioViewers });
+    }
+  }
+
   private async publishAudienceCapabilities(onlyStreamId?: string) {
     for (const publisher of this.publishers(onlyStreamId)) {
       const streamId = this.state(publisher).streamId!;
@@ -507,6 +602,38 @@ export class RoomRelay extends DurableObject<Env> {
       });
     }
   }
+
+  private async publishViewerHealth(streamId: string, force = false) {
+    const now = Date.now();
+    if (!force && now - (this.lastHealthPublished.get(streamId) ?? 0) < 1500) return;
+    this.lastHealthPublished.set(streamId, now);
+
+    const viewers = this.viewers(streamId);
+    const reports = viewers
+      .map(viewer => {
+        const state = this.state(viewer);
+        return { state, health: state.health };
+      })
+      .filter(item => item.state.receiveVideo !== false && item.health && now - item.health.updatedAt < 7000) as Array<{ state: Attachment; health: ViewerHealth }>;
+    const audioReports = reports.filter(item => item.state.receiveAudio !== false);
+    const min = (values: number[]) => values.length ? Math.min(...values) : 0;
+    const max = (values: number[]) => values.length ? Math.max(...values) : 0;
+
+    for (const publisher of this.publishers(streamId)) {
+      json(publisher, {
+        type: 'viewer-health',
+        viewers: viewers.length,
+        reporting: reports.length,
+        minDecodedFps: min(reports.map(item => item.health.decodedFps)),
+        maxDecodeQueue: max(reports.map(item => item.health.decodeQueue)),
+        dropped: max(reports.map(item => item.health.dropped)),
+        resets: max(reports.map(item => item.health.resets)),
+        audioBufferMs: min(audioReports.map(item => item.health.audioBufferMs)),
+        audioUnderflows: max(audioReports.map(item => item.health.audioUnderflows)),
+        stalled: reports.some(item => item.health.stalled)
+      });
+    }
+  }
 }
 
 export default {
@@ -514,8 +641,8 @@ export default {
     const url = new URL(request.url);
     if (url.pathname === '/health' || url.pathname === '/relay/health') {
       return Response.json({
-        ok: true, service: 'AKTela Relay', protocol: 5, roomProtocol: 3, stability: 'v2.5',
-        features: ['batched-media', 'publisher-names', 'three-publishers', 'selective-subscriptions', 'stream-discovery', 'room-quality-policy', 'capability-negotiation', 'fresh-keyframe-sync', 'hibernation-heartbeat', 'text-media-fallback']
+        ok: true, service: 'AKTela Relay', protocol: 5, roomProtocol: 3, stability: 'v3.5',
+        features: ['batched-media', 'publisher-names', 'three-publishers', 'selective-subscriptions', 'stream-discovery', 'room-quality-policy', 'capability-negotiation', 'fresh-keyframe-sync', 'hibernation-heartbeat', 'text-media-fallback', 'viewer-health', 'visibility-video-pause', 'viewer-demand']
       });
     }
 

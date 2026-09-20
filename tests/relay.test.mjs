@@ -214,12 +214,32 @@ test('hidden viewer stops receiving video and resumes only from a fresh keyframe
 
   target.sent.length = 0;
   await room.webSocketMessage(target, JSON.stringify({ type: 'set-video', enabled: true }));
-  assert.ok(messages(publisher).some(message => message.type === 'request-keyframe' && message.reason === 'viewer-visible'));
+  assert.equal(messages(publisher).filter(message => message.type === 'request-keyframe').length, 1,
+    'o pedido do ingresso já cobre a retomada imediata de visibilidade');
   assert.ok(messages(publisher).some(message => message.type === 'viewer-demand' && message.videoViewers === 1));
   await room.webSocketMessage(publisher, packet(false));
   assert.equal(target.sent.filter(value => value instanceof ArrayBuffer).length, 0);
   await room.webSocketMessage(publisher, packet(true));
   assert.equal(target.sent.filter(value => value instanceof ArrayBuffer).length, 1);
+});
+
+test('bursts of keyframe requests are coalesced per stream', async () => {
+  const { room, ctx } = fixture();
+  await room.fetch(new Request('https://relay/ws?role=publisher&publisherId=first'));
+  await room.fetch(new Request('https://relay/ws?role=viewer&viewerId=viewer&streamId=first'));
+  const publisher = ctx.getWebSockets('publisher')[0];
+  const target = ctx.getWebSockets('viewer')[0];
+
+  await room.webSocketMessage(target, JSON.stringify({ type: 'request-keyframe', reason: 'stall' }));
+  await room.webSocketMessage(target, JSON.stringify({ type: 'decoder-error' }));
+  await room.webSocketMessage(target, JSON.stringify({ type: 'set-video', enabled: true }));
+
+  assert.equal(messages(publisher).filter(message => message.type === 'request-keyframe').length, 1);
+
+  room.lastKeyframeRequested.set('first', 0);
+  await room.webSocketMessage(target, JSON.stringify({ type: 'request-keyframe', reason: 42 }));
+  assert.equal(messages(publisher).filter(message => message.type === 'request-keyframe').at(-1).reason, 'viewer-request',
+    'motivos malformados não devem chegar ao Capture');
 });
 
 test('viewer health is sanitized, aggregated and ignores paused video', async () => {
@@ -235,6 +255,7 @@ test('viewer health is sanitized, aggregated and ignores paused video', async ()
   }));
   const health = messages(publisher).filter(message => message.type === 'viewer-health').at(-1);
   assert.equal(health.reporting, 1);
+  assert.ok(health.sampleAt > 0, 'a amostra precisa identificar telemetria nova para a adaptação');
   assert.equal(health.minDecodedFps, 240);
   assert.equal(health.maxDecodeQueue, 0);
   assert.equal(health.audioBufferMs, 55);

@@ -177,6 +177,7 @@ function finiteNumber(value: unknown, fallback: number, minimum: number, maximum
 
 export class RoomRelay extends DurableObject<Env> {
   private readonly lastHealthPublished = new Map<string, number>();
+  private readonly lastKeyframeRequested = new Map<string, number>();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -432,8 +433,10 @@ export class RoomRelay extends DurableObject<Env> {
     if (affectedStreamId) {
       await this.publishViewerHealth(affectedStreamId, true);
       this.publishViewerDemand(affectedStreamId);
-      if (this.publishers(affectedStreamId).length === 0 && this.viewers(affectedStreamId).length === 0)
+      if (this.publishers(affectedStreamId).length === 0 && this.viewers(affectedStreamId).length === 0) {
         this.lastHealthPublished.delete(affectedStreamId);
+        this.lastKeyframeRequested.delete(affectedStreamId);
+      }
     }
   }
 
@@ -494,8 +497,17 @@ export class RoomRelay extends DurableObject<Env> {
     this.requestKeyframe(streamId, 'viewer-joined');
   }
 
-  private requestKeyframe(streamId: string, reason: string) {
-    for (const publisher of this.publishers(streamId)) json(publisher, { type: 'request-keyframe', reason });
+  private requestKeyframe(streamId: string, reason: unknown) {
+    const now = Date.now();
+    // Join, visibility, decoder and stall events often arrive in the same burst.
+    // One IDR satisfies all waiting viewers; forwarding each event used to restart
+    // the publisher repeatedly and was especially disruptive to games.
+    if (now - (this.lastKeyframeRequested.get(streamId) ?? 0) < 2000) return;
+    this.lastKeyframeRequested.set(streamId, now);
+    const safeReason = (typeof reason === 'string' ? reason : 'viewer-request')
+      .replace(/[\u0000-\u001f\u007f]/g, '')
+      .slice(0, 64) || 'viewer-request';
+    for (const publisher of this.publishers(streamId)) json(publisher, { type: 'request-keyframe', reason: safeReason });
   }
 
   private markViewersWaiting(streamId: string) {
@@ -622,6 +634,7 @@ export class RoomRelay extends DurableObject<Env> {
     for (const publisher of this.publishers(streamId)) {
       json(publisher, {
         type: 'viewer-health',
+        sampleAt: max(reports.map(item => item.health.updatedAt)),
         viewers: viewers.length,
         reporting: reports.length,
         minDecodedFps: min(reports.map(item => item.health.decodedFps)),
@@ -641,7 +654,7 @@ export default {
     const url = new URL(request.url);
     if (url.pathname === '/health' || url.pathname === '/relay/health') {
       return Response.json({
-        ok: true, service: 'AKTela Relay', protocol: 5, roomProtocol: 3, stability: 'v3.5',
+        ok: true, service: 'AKTela Relay', protocol: 5, roomProtocol: 3, stability: 'v3.6',
         features: ['batched-media', 'publisher-names', 'three-publishers', 'selective-subscriptions', 'stream-discovery', 'room-quality-policy', 'capability-negotiation', 'fresh-keyframe-sync', 'hibernation-heartbeat', 'text-media-fallback', 'viewer-health', 'visibility-video-pause', 'viewer-demand']
       });
     }

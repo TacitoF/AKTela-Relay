@@ -1,7 +1,8 @@
-# AKTela Relay 3.5.0
+# AKTela Relay 3.6.0
 
 Relay AKV5 em Cloudflare Workers com uma sala por Durable Object.
 
+- Agrupa por dois segundos pedidos simultâneos de keyframe por tela; ingresso, visibilidade e erro de decoder passam a exigir um único IDR.
 - Aceita até três transmissores por sala e preserva a posição de cada sessão durante reconexões.
 - Descobre as transmissões ativas e entrega mídia somente aos espectadores inscritos naquela tela.
 - Interrompe vídeo para espectadores com a Activity oculta e exige um quadro-chave novo ao retomá-lo.

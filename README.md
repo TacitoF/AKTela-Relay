@@ -1,7 +1,9 @@
-# AKTela Relay 3.6.0
+# AKTela Relay 3.7.0
 
 Relay AKV5 em Cloudflare Workers com uma sala por Durable Object.
 
+- Preserva todos os pacotes de áudio válidos do lote enquanto sincroniza o vídeo a partir de um novo quadro-chave.
+- Exclui espectadores com vídeo oculto da negociação de codec, sem interromper o áudio que continuam ouvindo.
 - Agrupa por dois segundos pedidos simultâneos de keyframe por tela; ingresso, visibilidade e erro de decoder passam a exigir um único IDR.
 - Aceita até três transmissores por sala e preserva a posição de cada sessão durante reconexões.
 - Descobre as transmissões ativas e entrega mídia somente aos espectadores inscritos naquela tela.
@@ -10,8 +12,8 @@ Relay AKV5 em Cloudflare Workers com uma sala por Durable Object.
 - Agrega FPS, fila, descartes, microfaltas e travamentos dos players para a adaptação automática de qualidade.
 - Reutiliza uma única conversão Base64 por variante de lote, em vez de reconverter a mesma mídia para cada espectador.
 - Analisa lotes AKB1 por fatias do buffer original, sem copiar cada pacote antes do encaminhamento.
-- Limita automaticamente salas com duas ou três telas a 720p e 30 FPS por transmissão.
-- Agrega os codecs suportados por todos os espectadores e informa o modo comum ao Capture.
+- Calcula o limite por transmissão a partir do layout dos espectadores: 720p30 para a grade, até 1080p60 para destaque quando todos os espectadores ativos daquela tela permitirem. Clientes anteriores conservam o limite de salas com várias telas.
+- Agrega os codecs suportados pelos espectadores que recebem vídeo e informa o modo comum ao Capture.
 - Sincroniza novos espectadores somente com um quadro-chave atual, evitando congelamentos e artefatos causados por referências antigas.
 - Informa imediatamente ao Capture os espectadores que já estavam na sala.
 - Valida capabilities e o envelope binário antes de retransmitir mídia.

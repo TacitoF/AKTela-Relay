@@ -36,6 +36,7 @@ type Attachment = {
   publisherName?: string;
   receiveAudio?: boolean;
   receiveVideo?: boolean;
+  maxModeKey?: ModeKey;
   capabilities?: ViewerCapabilities;
   health?: ViewerHealth;
 };
@@ -48,6 +49,7 @@ type ControlMessage = {
   audioOpus?: boolean;
   reason?: string;
   enabled?: boolean;
+  maxModeKey?: ModeKey;
   decodedFps?: number;
   decodeQueue?: number;
   dropped?: number;
@@ -318,12 +320,16 @@ export class RoomRelay extends DurableObject<Env> {
         }
 
         if (control.type === 'set-video' && typeof control.enabled === 'boolean') {
+          const resuming = control.enabled && attachment.receiveVideo === false;
           attachment.receiveVideo = control.enabled;
-          if (control.enabled) attachment.waitingForKeyframe = true;
+          if (MODE_ORDER.includes(control.maxModeKey as ModeKey)) attachment.maxModeKey = control.maxModeKey;
+          if (resuming) attachment.waitingForKeyframe = true;
           ws.serializeAttachment(attachment);
-          if (control.enabled) this.requestKeyframe(streamId, 'viewer-visible');
+          if (resuming) this.requestKeyframe(streamId, 'viewer-visible');
+          await this.publishAudienceCapabilities(streamId);
           await this.publishViewerHealth(streamId, true);
           this.publishViewerDemand(streamId);
+          this.publishRoomPolicy();
           return;
         }
 
@@ -388,7 +394,7 @@ export class RoomRelay extends DurableObject<Env> {
         if (state.waitingForKeyframe && receiveVideo) {
           const keyframeIndex = selected.findIndex(packet => packet.kind === 1 && packet.keyframe);
           selected = keyframeIndex >= 0
-            ? selected.slice(keyframeIndex)
+            ? selected.filter((packet, index) => packet.kind === 2 || index >= keyframeIndex)
             : selected.filter(packet => packet.kind === 2);
         }
         const outbound = selected.length === packets.length && selected.every((packet, index) => packet === packets[index])
@@ -554,8 +560,14 @@ export class RoomRelay extends DurableObject<Env> {
 
   private publishRoomPolicy() {
     const publishers = this.publishers();
-    const maxModeKey: ModeKey = publishers.length > 1 ? '720p30' : '1080p60';
+    const legacyCeiling: ModeKey = publishers.length > 1 ? '720p30' : '1080p60';
     for (const publisher of publishers) {
+      const streamId = this.state(publisher).streamId!;
+      const active = this.viewers(streamId).map(viewer => this.state(viewer)).filter(state => state.receiveVideo !== false);
+      const ceilings = active.map(state => state.maxModeKey ?? legacyCeiling);
+      const maxModeKey = ceilings.length > 0
+        ? MODE_ORDER[Math.max(...ceilings.map(mode => MODE_ORDER.indexOf(mode)))]
+        : '1080p60';
       json(publisher, { type: 'room-policy', activeStreams: publishers.length, maxStreams: MAX_STREAMS, maxModeKey });
     }
   }
@@ -572,7 +584,7 @@ export class RoomRelay extends DurableObject<Env> {
   private async publishAudienceCapabilities(onlyStreamId?: string) {
     for (const publisher of this.publishers(onlyStreamId)) {
       const streamId = this.state(publisher).streamId!;
-      const viewers = this.viewers(streamId);
+      const viewers = this.viewers(streamId).filter(viewer => this.state(viewer).receiveVideo !== false);
       if (viewers.length === 0) {
         json(publisher, {
           type: 'audience-capabilities', viewers: 0, readyViewers: 0, ready: true,
@@ -654,7 +666,7 @@ export default {
     const url = new URL(request.url);
     if (url.pathname === '/health' || url.pathname === '/relay/health') {
       return Response.json({
-        ok: true, service: 'AKTela Relay', protocol: 5, roomProtocol: 3, stability: 'v3.6',
+        ok: true, service: 'AKTela Relay', protocol: 5, roomProtocol: 3, stability: 'v3.7',
         features: ['batched-media', 'publisher-names', 'three-publishers', 'selective-subscriptions', 'stream-discovery', 'room-quality-policy', 'capability-negotiation', 'fresh-keyframe-sync', 'hibernation-heartbeat', 'text-media-fallback', 'viewer-health', 'visibility-video-pause', 'viewer-demand']
       });
     }

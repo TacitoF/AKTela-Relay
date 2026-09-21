@@ -141,7 +141,7 @@ test('media and capabilities are isolated by stream', async () => {
   assert.ok(capabilityMessages.some(m => m.viewers === 1 && m.videoCodec === 'vp8'));
 });
 
-test('observer receives the ordered stream list and multi-screen quality policy', async () => {
+test('idle publishers do not force a multi-screen quality limit', async () => {
   const { room, ctx } = fixture();
   await room.fetch(new Request('https://relay/ws?role=viewer&viewerId=observer&observe=1'));
   const observer = ctx.getWebSockets('observer')[0];
@@ -152,8 +152,70 @@ test('observer receives the ordered stream list and multi-screen quality policy'
   assert.deepEqual(list.streams.map(stream => stream.id), ['first', 'second']);
   assert.deepEqual(list.streams.map(stream => stream.publisherName), ['Tácito', 'Isabele']);
   for (const publisher of ctx.getWebSockets('publisher')) {
-    assert.ok(messages(publisher).some(m => m.type === 'room-policy' && m.activeStreams === 2 && m.maxModeKey === '720p30'));
+    assert.ok(messages(publisher).some(m => m.type === 'room-policy' && m.activeStreams === 2 && m.maxModeKey === '1080p60'));
   }
+});
+
+test('keyframe recovery preserves audio before the first video keyframe', async () => {
+  const { room, ctx } = fixture();
+  await room.fetch(new Request('https://relay/ws?role=publisher&publisherId=first'));
+  const publisher = ctx.getWebSockets('publisher')[0];
+  const target = viewer(ctx, 'listener', 'first');
+  await room.webSocketMessage(publisher, batch(packet(false, 1, 2), packet(false), packet(true), packet(false, 1, 2)));
+  const output = target.sent.find(value => value instanceof ArrayBuffer);
+  const view = new DataView(output);
+  const kinds = [];
+  let offset = 8;
+  for (let i = 0; i < view.getUint16(6, true); i++) {
+    const length = view.getInt32(offset, true);
+    kinds.push(view.getUint8(offset + 4 + 5));
+    offset += 4 + length;
+  }
+  assert.deepEqual(kinds, [2, 1, 2], 'recuperar vídeo não pode descartar áudio válido');
+});
+
+test('an audio-only viewer cannot block video negotiation and is included again on resume', async () => {
+  const { room, ctx } = fixture();
+  await room.fetch(new Request('https://relay/ws?role=publisher&publisherId=first'));
+  const publisher = ctx.getWebSockets('publisher')[0];
+  viewer(ctx, 'visible', 'first');
+  const hidden = viewer(ctx, 'hidden', 'first');
+  await room.webSocketMessage(hidden, JSON.stringify({ type: 'viewer-capabilities', protocol: 5, modes: { '720p30': ['vp8'] } }));
+  await room.webSocketMessage(hidden, JSON.stringify({ type: 'set-video', enabled: false }));
+  let caps = messages(publisher).filter(message => message.type === 'audience-capabilities').at(-1);
+  assert.equal(caps.ready, true);
+  assert.equal(caps.viewers, 1);
+  assert.equal(caps.videoCodec, 'h264');
+  const demand = messages(publisher).filter(message => message.type === 'viewer-demand').at(-1);
+  assert.equal(demand.viewers, 2);
+  assert.equal(demand.audioViewers, 2);
+  await room.webSocketMessage(hidden, JSON.stringify({ type: 'set-video', enabled: true }));
+  caps = messages(publisher).filter(message => message.type === 'audience-capabilities').at(-1);
+  assert.equal(caps.ready, false);
+  assert.equal(caps.viewers, 2);
+});
+
+test('quality follows active viewer layouts independently for each stream', async () => {
+  const { room, ctx } = fixture();
+  await room.fetch(new Request('https://relay/ws?role=publisher&publisherId=first'));
+  await room.fetch(new Request('https://relay/ws?role=publisher&publisherId=second'));
+  const [first, second] = ctx.getWebSockets('publisher');
+  const focused = viewer(ctx, 'focused', 'first');
+  const grid = viewer(ctx, 'grid', 'second');
+  const policy = publisher => messages(publisher).filter(message => message.type === 'room-policy').at(-1).maxModeKey;
+  await room.webSocketMessage(focused, JSON.stringify({ type: 'set-video', enabled: true, maxModeKey: '1080p60' }));
+  await room.webSocketMessage(grid, JSON.stringify({ type: 'set-video', enabled: true, maxModeKey: '720p30' }));
+  assert.equal(policy(first), '1080p60');
+  assert.equal(policy(second), '720p30');
+  const otherGrid = viewer(ctx, 'other-grid', 'first');
+  await room.webSocketMessage(otherGrid, JSON.stringify({ type: 'set-video', enabled: true, maxModeKey: '720p30' }));
+  assert.equal(policy(first), '720p30', 'ainda precisa proteger quem assiste à grade');
+  await room.webSocketMessage(otherGrid, JSON.stringify({ type: 'set-video', enabled: false }));
+  assert.equal(policy(first), '1080p60');
+  const before = messages(first).filter(message => message.type === 'request-keyframe').length;
+  await room.webSocketMessage(focused, JSON.stringify({ type: 'set-video', enabled: true, maxModeKey: '1080p60' }));
+  assert.equal(messages(first).filter(message => message.type === 'request-keyframe').length, before,
+    'atualizar o layout não deve iniciar recuperação desnecessária');
 });
 
 test('batched media uses one relay message and preserves keyframe recovery', async () => {
